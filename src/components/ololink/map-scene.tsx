@@ -363,25 +363,6 @@ export function MapScene({ state }: { state: OloLinkState }) {
             preserveAspectRatio="none"
           />
 
-          {/* graticule */}
-          <g stroke="#dbeafe" strokeOpacity={0.08} strokeWidth={0.5 * inv}>
-            {Array.from({ length: 11 }, (_, i) => (i + 1) * (MAP_W / 12)).map((x) => (
-              <line key={`v${x}`} x1={x} y1={0} x2={x} y2={MAP_H} />
-            ))}
-            {Array.from({ length: 5 }, (_, i) => (i + 1) * (MAP_H / 6)).map((y) => (
-              <line key={`h${y}`} x1={0} y1={y} x2={MAP_W} y2={y} />
-            ))}
-          </g>
-          <line
-            x1={0}
-            y1={MAP_H / 2}
-            x2={MAP_W}
-            y2={MAP_H / 2}
-            stroke="#e2e8f0"
-            strokeOpacity={0.16}
-            strokeWidth={0.6 * inv}
-            strokeDasharray={`${6 * inv} ${6 * inv}`}
-          />
 
 
         {/* operational regions */}
