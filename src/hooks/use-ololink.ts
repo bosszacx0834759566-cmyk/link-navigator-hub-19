@@ -21,7 +21,15 @@ export type RailId =
   | 'analytics'
   | 'alerts'
   | 'settings'
-  | 'context';
+  | 'context'
+  | 'leo'
+  | 'haps'
+  | 'drone'
+  | 'ground'
+  | 'search'
+  | 'view';
+
+export type ViewMode = '3d' | '2d';
 
 export interface Selection {
   type: 'asset' | 'link';
@@ -73,6 +81,9 @@ export interface OloLinkState {
   aiProcessing: boolean;
   running: boolean;
   layers: { weather: boolean; orbits: boolean; labels: boolean; routes: boolean };
+  /** spatial environment view mode — same mission state, different projection */
+  view: ViewMode;
+  setView: (v: ViewMode) => void;
   techFilter: Record<Tech, boolean>;
   /** receiverId -> satellite id currently inside a simulated communication window */
   windows: Record<string, string | null>;
@@ -85,6 +96,8 @@ export interface OloLinkState {
   toggleLayer: (k: keyof OloLinkState['layers']) => void;
   setRunning: (v: boolean) => void;
   approve: () => void;
+  /** reset every comm/link signal: scenario, windows, routes, telemetry, clock */
+  reset: () => void;
 }
 
 
@@ -99,6 +112,7 @@ export function useOloLink(): OloLinkState {
   const [rerouteSeq, setRerouteSeq] = useState(0);
   const [reroutingIds, setReroutingIds] = useState<Set<string>>(new Set());
   const [layers, setLayers] = useState({ weather: true, orbits: true, labels: true, routes: true });
+  const [view, setViewState] = useState<ViewMode>('3d');
   const [techFilter, setTechFilter] = useState<Record<Tech, boolean>>({
     OPTICAL: true,
     FSO: true,
@@ -191,8 +205,8 @@ export function useOloLink(): OloLinkState {
       if (id === scenarioId) return;
       setAiProcessing(true);
       push('INFO', `Weather state change → ${SCENARIOS[id].name}`);
-      const outgoing = routeSegments(SCENARIOS[scenarioId].route);
-      const incoming = routeSegments(SCENARIOS[id].route);
+      const outgoing = routeSegments(SCENARIOS[scenarioId].route, SCENARIOS[scenarioId].routeSegmentIds);
+      const incoming = routeSegments(SCENARIOS[id].route, SCENARIOS[id].routeSegmentIds);
       setReroutingIds(new Set([...outgoing, ...incoming].map((s) => s.id)));
       setTimeout(() => {
         setPreviousRoute(outgoing);
@@ -209,8 +223,26 @@ export function useOloLink(): OloLinkState {
     [scenarioId, push]
   );
 
+  const reset = useCallback(() => {
+    clock.current = 0;
+    counter.current = 0;
+    setMissionTime(0);
+    setScenarioId('clear');
+    setSelection(null);
+    setAiProcessing(false);
+    setPreviousRoute(null);
+    setReroutingIds(new Set());
+    setTelemetry(SCENARIOS.clear.telemetry);
+    setWindows({});
+    setRunning(true);
+    setEvents([
+      { id: 'e0', time: 'T+00:00', level: 'INFO', text: 'Orchestration session reset' },
+      { id: 'e1', time: 'T+00:00', level: 'OK', text: 'All laser/comm links re-initialised' },
+    ]);
+  }, []);
+
   const links = useMemo(() => linkStates(profile, reroutingIds), [profile, reroutingIds]);
-  const route = useMemo(() => routeSegments(profile.route), [profile]);
+  const route = useMemo(() => routeSegments(profile.route, profile.routeSegmentIds), [profile]);
 
   // clear the ghost of the replaced route once it has finished fading
   useEffect(() => {
@@ -245,14 +277,14 @@ export function useOloLink(): OloLinkState {
     select: (s) => {
       setSelection(s);
       if (s) {
-        setPanel((p) => (p === null || p === 'context' ? 'context' : p));
         push('INFO', `Inspector focus: ${s.type === 'asset' ? s.id : `link ${s.id}`}`);
-      } else {
-        setPanel((p) => (p === 'context' ? null : p));
       }
     },
+    view,
+    setView: (v) => setViewState(v),
     toggleLayer: (k) => setLayers((l) => ({ ...l, [k]: !l[k] })),
     setRunning,
     approve: () => push('OK', `Operator approved: ${profile.ai.action}`),
+    reset,
   };
 }

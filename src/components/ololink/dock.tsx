@@ -237,29 +237,6 @@ export function Dock({ state }: { state: OloLinkState }) {
         )}
       </AnimatePresence>
 
-      <div className="flex items-center gap-1 rounded-xl border border-white/[0.07] bg-black/80 px-2 py-1.5 shadow-[0_12px_44px_-14px_rgba(0,0,0,0.9)] backdrop-blur-xl">
-        <DockButton label="Search" active={pop === 'search'} onClick={() => toggle('search')}>
-          <Search className="h-4 w-4" strokeWidth={1.6} />
-        </DockButton>
-        <DockButton label="Layers" active={pop === 'layers'} onClick={() => toggle('layers')}>
-          <Layers className="h-4 w-4" strokeWidth={1.6} />
-        </DockButton>
-        <DockButton label="Filters" active={pop === 'filters'} onClick={() => toggle('filters')}>
-          <SlidersHorizontal className="h-4 w-4" strokeWidth={1.6} />
-        </DockButton>
-        <DockButton label="History" active={pop === 'history'} onClick={() => toggle('history')}>
-          <History className="h-4 w-4" strokeWidth={1.6} />
-        </DockButton>
-
-        <span className="mx-1 h-5 w-px bg-white/[0.08]" />
-
-        <DockButton label={running ? 'Pause' : 'Resume'} onClick={() => setRunning(!running)} active={!running}>
-          {running ? <Pause className="h-4 w-4" strokeWidth={1.6} /> : <Play className="h-4 w-4" strokeWidth={1.6} />}
-        </DockButton>
-        <span className="px-1.5 font-mono text-[9px] uppercase tracking-[0.18em] text-muted-foreground/70">
-          {SCENARIOS[scenarioId].short}
-        </span>
-      </div>
     </div>
   );
 }

@@ -1,14 +1,24 @@
 'use client';
 
-import { Canvas, useFrame, useLoader, type ThreeEvent } from '@react-three/fiber';
+import { Canvas, useFrame, useLoader, useThree, type ThreeEvent } from '@react-three/fiber';
+
 import { Html, OrbitControls, Stars } from '@react-three/drei';
-import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  createContext,
+  Suspense,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import * as THREE from 'three';
 
-import earthDay from '@/assets/earth_atmos_2048.jpg';
+import { EARTH_8K_URL, EARTH_TILE_BY_REGION, type EarthTile } from '@/lib/earth-textures';
 import earthNight from '@/assets/earth_lights_2048.png';
 import earthClouds from '@/assets/earth_clouds_1024.png';
 import earthSpec from '@/assets/earth_specular_2048.jpg';
+
 import {
   ASSET_BY_ID,
   ASSETS,
@@ -19,9 +29,35 @@ import {
   type LinkState,
   type ScenarioProfile,
   type Segment,
+  AMBIENT_CELLS,
   type WeatherCell,
 } from '@/lib/ololink';
 import type { OloLinkState, Selection } from '@/hooks/use-ololink';
+import { LabelLayer, LabelProjector, useLabel } from '@/components/ololink/label-layer';
+import {
+  
+  OPERATIONAL_VIEW,
+  fitView,
+  pointView,
+  presetView,
+  stationInto,
+  type CameraView,
+  type PresetId,
+} from '@/lib/camera-presets';
+import {
+  LAYER,
+  LAYER_STACK,
+  
+  REGIONS,
+  REGION_BY_ID,
+  assetVec,
+  geoOnShell,
+  layerRadius,
+  lodForDistance,
+  regionIdOf,
+  type LodLevel,
+  type RegionDef,
+} from '@/lib/layers';
 import {
   DOWNLINK_TARGETS,
   SAT_ORBITS,
@@ -43,7 +79,106 @@ const CYAN = '#38bdf8';
 const UP = new THREE.Vector3(0, 1, 0);
 
 function vec(a: Asset) {
-  return new THREE.Vector3(...geoToVec(a.lat, a.lon, a.altKm));
+  return new THREE.Vector3(...assetVec(a));
+}
+
+/* --------------------------------------------------- level-of-detail ctx */
+
+interface LodState {
+  level: LodLevel;
+  /** region the camera is currently looking at, if any */
+  region: string | null;
+}
+
+const LodContext = createContext<LodState>({ level: 'global', region: null });
+const useLod = () => useContext(LodContext);
+
+/** Watches the camera and derives view level + focused region. */
+function LodDriver({ onChange }: { onChange: (s: LodState) => void }) {
+  const last = useRef<LodState>({ level: 'global', region: null });
+  const dir = useRef(new THREE.Vector3());
+  const normals = useMemo(
+    () =>
+      REGIONS.map((r) => ({
+        id: r.id,
+        n: new THREE.Vector3(...geoOnShell(r.lat, r.lon, 1)).normalize(),
+      })),
+    []
+  );
+
+  useFrame(({ camera }) => {
+    const d = camera.position.length();
+    const level = lodForDistance(d);
+    dir.current.copy(camera.position).normalize();
+    let region: string | null = null;
+    let best = 0.62;
+    for (const r of normals) {
+      const dot = r.n.dot(dir.current);
+      if (dot > best) {
+        best = dot;
+        region = r.id;
+      }
+    }
+    if (level === 'global') region = null;
+    if (last.current.level !== level || last.current.region !== region) {
+      last.current = { level, region };
+      onChange(last.current);
+    }
+  });
+  return null;
+}
+
+/** Smoothly fades a group in/out so LOD changes never pop. */
+function Fade({
+  show,
+  speed = 3.2,
+  children,
+}: {
+  show: boolean;
+  speed?: number;
+  children: React.ReactNode;
+}) {
+  const group = useRef<THREE.Group>(null);
+  const v = useRef(show ? 1 : 0);
+  const mounted = useRef(show);
+  const [alive, setAlive] = useState(show);
+
+  useFrame((_, d) => {
+    const g = group.current;
+    v.current += ((show ? 1 : 0) - v.current) * Math.min(1, d * speed);
+    if (!g) return;
+    const a = v.current;
+    g.visible = a > 0.015;
+    g.scale.setScalar(0.92 + a * 0.08);
+    g.traverse((o) => {
+      const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+      if (!m) return;
+      const apply = (mm: THREE.Material) => {
+        const anyM = mm as THREE.Material & { userData: { base?: number }; opacity: number };
+        if (anyM.userData.base === undefined) anyM.userData.base = anyM.opacity;
+        anyM.transparent = true;
+        anyM.opacity = anyM.userData.base * a;
+      };
+      Array.isArray(m) ? m.forEach(apply) : apply(m);
+    });
+    if (!show && a < 0.02 && mounted.current) {
+      mounted.current = false;
+      setAlive(false);
+    } else if (show && !mounted.current) {
+      mounted.current = true;
+      setAlive(true);
+    }
+  });
+
+  useEffect(() => {
+    if (show) {
+      mounted.current = true;
+      setAlive(true);
+    }
+  }, [show]);
+
+  if (!alive && !show) return null;
+  return <group ref={group}>{children}</group>;
 }
 
 /** Quaternion that stands an object up on the sphere surface. */
@@ -77,14 +212,86 @@ function curveForSegment(segment: Segment) {
 /** Direction of the sun — chosen so the terminator crosses both regions. */
 export const SUN_DIR = new THREE.Vector3(...geoToVec(14, 178, 0)).normalize();
 
+const DEG = Math.PI / 180;
+
+/**
+ * Sharpens a texture for close-up viewing without inflating GPU memory:
+ * trilinear mipmapping (so the 8K map does not shimmer when zoomed out) plus
+ * hardware anisotropic filtering (so it stays crisp at grazing angles).
+ */
+function tuneEarthTexture(tex: THREE.Texture, maxAniso: number, srgb = true) {
+  if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
+  tex.generateMipmaps = true;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.anisotropy = Math.min(8, maxAniso);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/**
+ * Native-resolution imagery patch laid over the 8K globe for the region the
+ * camera is looking at. Only one tile is ever resident, so the extra GPU cost
+ * is a single ~3k x 1.4k texture.
+ */
+function RegionTile({ tile }: { tile: EarthTile }) {
+  const gl = useThree((s) => s.gl);
+  const map = useLoader(THREE.TextureLoader, tile.url);
+  useMemo(() => tuneEarthTexture(map, gl.capabilities.getMaxAnisotropy()), [map, gl]);
+
+  const args = useMemo(
+    () =>
+      [
+        1,
+        96,
+        96,
+        (tile.lonMin + 180) * DEG,
+        (tile.lonMax - tile.lonMin) * DEG,
+        (90 - tile.latMax) * DEG,
+        (tile.latMax - tile.latMin) * DEG,
+      ] as const,
+    [tile]
+  );
+
+  return (
+    <mesh scale={1.0006} renderOrder={1}>
+      <sphereGeometry args={[...args]} />
+      <meshStandardMaterial
+        map={map}
+        metalness={0.05}
+        roughness={0.82}
+        color="#e6eef5"
+        polygonOffset
+        polygonOffsetFactor={-1}
+      />
+    </mesh>
+  );
+}
+
 function Earth() {
-  const maps = useLoader(THREE.TextureLoader, [earthDay, earthNight, earthClouds, earthSpec]);
+  const gl = useThree((s) => s.gl);
+  const { level, region } = useLod();
+  const maps = useLoader(THREE.TextureLoader, [
+    EARTH_8K_URL,
+    earthNight,
+    earthClouds,
+    earthSpec,
+  ]);
   const day = maps[0]!;
   const night = maps[1]!;
   const clouds = maps[2]!;
   const spec = maps[3]!;
-  day.colorSpace = THREE.SRGBColorSpace;
-  night.colorSpace = THREE.SRGBColorSpace;
+
+  useMemo(() => {
+    const maxAniso = gl.capabilities.getMaxAnisotropy();
+    tuneEarthTexture(day, maxAniso);
+    tuneEarthTexture(night, maxAniso);
+    tuneEarthTexture(clouds, maxAniso, false);
+  }, [day, night, clouds, gl]);
+
+  /** regional + local views get the native-resolution imagery tile */
+  const tile = level !== 'global' && region ? EARTH_TILE_BY_REGION[region] : undefined;
 
   const cloudRef = useRef<THREE.Mesh>(null);
   useFrame((_, d) => {
@@ -93,7 +300,7 @@ function Earth() {
 
   return (
     <group>
-      {/* realistic surface: satellite albedo, sun-lit */}
+      {/* realistic surface: NASA Blue Marble 8K albedo, sun-lit */}
       <mesh>
         <sphereGeometry args={[1, 128, 128]} />
         <meshStandardMaterial
@@ -104,6 +311,14 @@ function Earth() {
           color="#e6eef5"
         />
       </mesh>
+
+      {/* high-resolution regional imagery */}
+      {tile ? (
+        <Suspense fallback={null}>
+          <RegionTile tile={tile} />
+        </Suspense>
+      ) : null}
+
       {/* city lights — additive, masked to the night hemisphere only */}
       <mesh scale={1.001}>
         <sphereGeometry args={[1, 96, 96]} />
@@ -155,6 +370,7 @@ function Earth() {
     </group>
   );
 }
+
 
 
 /* --------------------------------------------- orbital trajectory rings */
@@ -292,6 +508,205 @@ function DashedLine({
 }
 
 /**
+ * Live pass contact: whenever a LEO rises above a receiver's horizon it
+ * acquires the station and starts transmitting — downlink packets stream
+ * sat → station, a fainter uplink pulse returns, and the whole contact fades
+ * in and out with the pass geometry (elevation + slant range).
+ */
+const DOWN_PACKETS = 3;
+
+function PassBeam({ satId, rxId, live }: { satId: string; rxId: string; live: LiveMap }) {
+  const N = 2;
+  const core = useRef<THREE.Line>(null);
+  const packs = useRef<THREE.Group>(null);
+  const uplink = useRef<THREE.Mesh>(null);
+  const glow = useRef<THREE.Mesh>(null);
+  const vis = useRef(0);
+  const flow = useRef(Math.random());
+  const upFlow = useRef(Math.random());
+
+  const geometry = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array((N + 1) * 3), 3));
+    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 4);
+    return g;
+  }, []);
+
+  const scratch = useMemo(
+    () => ({ a: new THREE.Vector3(), b: new THREE.Vector3(), p: new THREE.Vector3() }),
+    []
+  );
+
+  useFrame((_, d) => {
+    const from = live.get(satId);
+    const to = live.get(rxId);
+    if (!from || !to) return;
+    const { a, b, p } = scratch;
+    a.copy(from);
+    b.copy(to);
+
+    // contact quality drives brightness and data rate, like a real pass
+    const score = windowScore(a, b);
+    const target = THREE.MathUtils.smoothstep(score, 0.15, 0.6);
+    vis.current += (target - vis.current) * Math.min(1, d * 1.4);
+    const v = vis.current;
+
+    // gentle, unhurried stream — a burst per pass, not a strobe
+    const rate = 0.12 + 0.18 * score;
+    flow.current = (flow.current + d * rate) % 1;
+    upFlow.current = (upFlow.current + d * rate * 0.4) % 1;
+
+    const attr = geometry.getAttribute('position') as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
+    for (let i = 0; i <= N; i++) {
+      p.copy(a).lerp(b, i / N);
+      arr[i * 3] = p.x;
+      arr[i * 3 + 1] = p.y;
+      arr[i * 3 + 2] = p.z;
+    }
+    attr.needsUpdate = true;
+
+    if (core.current) {
+      const m = core.current.material as THREE.LineBasicMaterial;
+      m.opacity = v * 0.28;
+      core.current.visible = v > 0.02;
+    }
+    if (packs.current) {
+      packs.current.visible = v > 0.05;
+      packs.current.children.forEach((child, i) => {
+        const t = (flow.current + i / DOWN_PACKETS) % 1;
+        child.position.copy(p.copy(a).lerp(b, t));
+        const mat = (child as THREE.Mesh).material as THREE.MeshBasicMaterial;
+        mat.opacity = v * Math.pow(Math.sin(t * Math.PI), 2) * 0.7;
+      });
+    }
+    if (uplink.current) {
+      const t = 1 - upFlow.current;
+      uplink.current.visible = v > 0.3;
+      uplink.current.position.copy(p.copy(a).lerp(b, t));
+      (uplink.current.material as THREE.MeshBasicMaterial).opacity =
+        v * Math.sin((1 - t) * Math.PI) * 0.3;
+    }
+    if (glow.current) {
+      // receiving station lights up softly while it is taking data
+      glow.current.visible = v > 0.08;
+      glow.current.position.copy(b);
+      glow.current.scale.setScalar(1);
+      (glow.current.material as THREE.MeshBasicMaterial).opacity = v * 0.22;
+    }
+  });
+
+  return (
+    <group>
+      {/* @ts-expect-error three line primitive */}
+      <line ref={core} geometry={geometry}>
+        <lineBasicMaterial
+          color={CYAN}
+          transparent
+          opacity={0}
+          depthWrite={false}
+          blending={THREE.AdditiveBlending}
+        />
+      </line>
+      <group ref={packs}>
+        {Array.from({ length: DOWN_PACKETS }, (_, i) => (
+          <mesh key={i}>
+            <sphereGeometry args={[0.004, 8, 8]} />
+            <meshBasicMaterial
+              color="#f0f9ff"
+              transparent
+              opacity={0}
+              depthWrite={false}
+              blending={THREE.AdditiveBlending}
+            />
+          </mesh>
+        ))}
+      </group>
+      <mesh ref={uplink}>
+        <sphereGeometry args={[0.0028, 6, 6]} />
+        <meshBasicMaterial
+          color="#7dd3fc"
+          transparent
+          opacity={0}
+          depthWrite={false}
+          blending={THREE.AdditiveBlending}
+        />
+      </mesh>
+      <mesh ref={glow}>
+        <sphereGeometry args={[0.009, 12, 12]} />
+        <meshBasicMaterial
+          color="#bae6fd"
+          transparent
+          opacity={0}
+          depthWrite={false}
+          blending={THREE.AdditiveBlending}
+        />
+      </mesh>
+    </group>
+  );
+}
+
+/**
+ * Contact scheduler: every ~0.3 s it re-evaluates which LEO is above which
+ * receiver's horizon and opens/closes contacts accordingly, with acquisition
+ * and loss-of-signal thresholds (hysteresis) so links don't flicker.
+ */
+const PASS_RECEIVERS = ASSETS.filter((a) => a.kind === 'ground' || a.kind === 'haps');
+const ACQUIRE = 0.34;
+const LOS = 0.16;
+const MAX_PER_RX = 1;
+const MAX_CONTACTS = 14;
+
+function PassNetwork({ live, running }: { live: LiveMap; running: boolean }) {
+  const [pairs, setPairs] = useState<string[]>([]);
+  const held = useRef<Set<string>>(new Set());
+  const acc = useRef(0);
+  const tmp = useRef(new THREE.Vector3());
+
+  useFrame((_, d) => {
+    acc.current += d;
+    if (acc.current < 0.3) return;
+    acc.current = 0;
+    if (!running) return;
+
+    const candidates: { key: string; score: number }[] = [];
+    for (const rx of PASS_RECEIVERS) {
+      const rp = live.get(rx.id);
+      if (!rp) continue;
+      const local: { key: string; score: number }[] = [];
+      for (const sat of SATELLITES) {
+        const sp = live.get(sat.id);
+        if (!sp) continue;
+        const score = windowScore(tmp.current.copy(sp), rp);
+        const key = `${sat.id}|${rx.id}`;
+        const threshold = held.current.has(key) ? LOS : ACQUIRE;
+        if (score > threshold) local.push({ key, score });
+      }
+      local.sort((x, y) => y.score - x.score);
+      candidates.push(...local.slice(0, MAX_PER_RX));
+    }
+    candidates.sort((x, y) => y.score - x.score);
+    const next = candidates.slice(0, MAX_CONTACTS).map((c) => c.key).sort();
+
+    const prev = held.current;
+    if (next.length !== prev.size || next.some((k) => !prev.has(k))) {
+      held.current = new Set(next);
+      setPairs(next);
+    }
+  });
+
+  return (
+    <>
+      {pairs.map((key) => {
+        const [satId, rxId] = key.split('|') as [string, string];
+        return <PassBeam key={key} satId={satId} rxId={rxId} live={live} />;
+      })}
+    </>
+  );
+}
+
+
+/**
  * Live satellite downlink: geometry is re-sampled every frame from the moving
  * satellite, and the optical beam only exists inside a communication window.
  */
@@ -314,7 +729,7 @@ function DownlinkBeam({
   const meta = TECH_META[link.segment.tech];
   const blocked = link.status === 'UNAVAILABLE';
   const degraded = link.status === 'DEGRADED';
-  const active = inWindow && !blocked;
+  
 
   const core = useRef<THREE.Line>(null);
   const sheath = useRef<THREE.Line>(null);
@@ -346,39 +761,30 @@ function DownlinkBeam({
     const to = live.get(link.segment.to);
     if (!from || !to) return;
 
-    const target = active ? 1 : 0;
-    vis.current += (target - vis.current) * Math.min(1, d * 1.8);
-    flow.current = (flow.current + d * 0.5) % 1;
-
-    const { a, b, mid, p, q } = scratch;
+    const { a, b, p, q } = scratch;
     a.copy(from);
     b.copy(to);
-    mid.copy(a).add(b).multiplyScalar(0.5);
-    mid.setLength(Math.max(a.length(), b.length()) * (1 + a.distanceTo(b) * 0.03));
+
+    // any LEO that is actually passing over the receiver transmits — not just
+    // the single best-scoring satellite
+    const pass = windowScore(a, b) > 0.16;
+    const target = !blocked && (pass || inWindow) ? 1 : 0;
+    vis.current += (target - vis.current) * Math.min(1, d * 1.8);
+    flow.current = (flow.current + d * 0.5) % 1;
 
     const attr = geometry.getAttribute('position') as THREE.BufferAttribute;
     const arr = attr.array as Float32Array;
     for (let i = 0; i <= N; i++) {
       const t = i / N;
-      const inv = 1 - t;
-      p.copy(a)
-        .multiplyScalar(inv * inv)
-        .addScaledVector(mid, 2 * inv * t)
-        .addScaledVector(b, t * t);
+      // straight line-of-sight beam
+      p.copy(a).lerp(b, t);
       arr[i * 3] = p.x;
       arr[i * 3 + 1] = p.y;
       arr[i * 3 + 2] = p.z;
     }
     attr.needsUpdate = true;
 
-    const bezier = (t: number, out: THREE.Vector3) => {
-      const inv = 1 - t;
-      return out
-        .copy(a)
-        .multiplyScalar(inv * inv)
-        .addScaledVector(mid, 2 * inv * t)
-        .addScaledVector(b, t * t);
-    };
+    const bezier = (t: number, out: THREE.Vector3) => out.copy(a).lerp(b, t);
 
     const boost = highlighted || selected ? 1.3 : 1;
     const v = vis.current;
@@ -774,139 +1180,283 @@ const KIND_COLOR: Record<Asset['kind'], string> = {
   customer: '#e2e8f0',
 };
 
+/* Shared aerospace-grade material palette — lightweight, physically believable. */
+const HULL = { color: '#d7dee6', metalness: 0.55, roughness: 0.42 } as const;
+const DARK_HULL = { color: '#8b95a2', metalness: 0.6, roughness: 0.5 } as const;
+const SOLAR = { color: '#16305e', metalness: 0.35, roughness: 0.28 } as const;
+const GOLD_FOIL = { color: '#c8a24a', metalness: 0.85, roughness: 0.35 } as const;
+const CONCRETE = { color: '#7b8590', metalness: 0.05, roughness: 0.95 } as const;
+
+/**
+ * LEO communications satellite — rectangular bus, two deployed solar wings,
+ * nadir-pointing high-gain dish and a pair of comm antennas.
+ * Nadir is -Y (the node frame is stood up on the sphere surface).
+ */
 function Satellite({ s, color }: { s: number; color: string }) {
   const ref = useRef<THREE.Group>(null);
-  useFrame((_, d) => {
-    if (ref.current) ref.current.rotation.y += d * 0.5;
+  useFrame(({ clock }) => {
+    // slow yaw about the nadir axis — attitude control, not a spin
+    if (ref.current) ref.current.rotation.y = Math.sin(clock.elapsedTime * 0.12) * 0.35;
   });
   return (
     <group ref={ref}>
-      <mesh>
-        <boxGeometry args={[s * 0.9, s * 0.7, s * 0.7]} />
-        <meshBasicMaterial color={color} />
+      {/* spacecraft bus */}
+      <mesh castShadow>
+        <boxGeometry args={[s * 0.62, s * 0.78, s * 0.62]} />
+        <meshStandardMaterial {...HULL} />
       </mesh>
+      {/* MLI blanket band */}
+      <mesh position={[0, s * 0.12, 0]}>
+        <boxGeometry args={[s * 0.65, s * 0.22, s * 0.65]} />
+        <meshStandardMaterial {...GOLD_FOIL} />
+      </mesh>
+
+      {/* solar wings: yoke + two panel sections per side */}
       {[-1, 1].map((dir) => (
-        <mesh key={dir} position={[dir * s * 1.35, 0, 0]}>
-          <boxGeometry args={[s * 1.6, s * 0.06, s * 0.8]} />
-          <meshBasicMaterial color="#1e3a8a" />
+        <group key={dir}>
+          <mesh position={[dir * s * 0.42, 0, 0]} rotation={[0, 0, Math.PI / 2]}>
+            <cylinderGeometry args={[s * 0.035, s * 0.035, s * 0.25, 6]} />
+            <meshStandardMaterial {...DARK_HULL} />
+          </mesh>
+          {[0.95, 1.85].map((off) => (
+            <mesh key={off} position={[dir * s * off, 0, 0]}>
+              <boxGeometry args={[s * 0.82, s * 0.02, s * 0.5]} />
+              <meshStandardMaterial {...SOLAR} />
+            </mesh>
+          ))}
+        </group>
+      ))}
+
+      {/* nadir high-gain dish */}
+      <group position={[0, -s * 0.46, 0]} rotation={[Math.PI, 0, 0]}>
+        <mesh>
+          <sphereGeometry args={[s * 0.3, 16, 8, 0, Math.PI * 2, 0, 0.72]} />
+          <meshStandardMaterial color={color} metalness={0.5} roughness={0.35} side={THREE.DoubleSide} />
+        </mesh>
+        <mesh position={[0, s * 0.18, 0]}>
+          <cylinderGeometry args={[s * 0.03, s * 0.05, s * 0.16, 6]} />
+          <meshStandardMaterial {...HULL} />
+        </mesh>
+      </group>
+
+      {/* comm antennas / boom */}
+      {[-1, 1].map((dir) => (
+        <mesh key={dir} position={[0, -s * 0.18, dir * s * 0.36]} rotation={[dir * 0.5, 0, 0]}>
+          <cylinderGeometry args={[s * 0.012, s * 0.012, s * 0.42, 4]} />
+          <meshStandardMaterial {...DARK_HULL} />
         </mesh>
       ))}
-      {/* downlink aperture */}
-      <mesh position={[0, -s * 0.55, 0]} rotation={[Math.PI, 0, 0]}>
-        <coneGeometry args={[s * 0.35, s * 0.4, 10, 1, true]} />
-        <meshBasicMaterial color={color} side={THREE.DoubleSide} transparent opacity={0.8} />
-      </mesh>
     </group>
   );
 }
 
+/** Slowly turning propeller disc used by both aircraft. */
+function Prop({ r, speed, thick }: { r: number; speed: number; thick: number }) {
+  const ref = useRef<THREE.Group>(null);
+  useFrame((_, d) => {
+    if (ref.current) ref.current.rotation.z += d * speed;
+  });
+  return (
+    <group ref={ref}>
+      {[0, Math.PI / 2].map((a) => (
+        <mesh key={a} rotation={[0, 0, a]}>
+          <boxGeometry args={[r * 2, thick, thick * 0.6]} />
+          <meshStandardMaterial color="#aab4c0" metalness={0.4} roughness={0.6} />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+/**
+ * HAPS — solar-electric stratospheric fixed-wing platform (~18–20 km).
+ * Extreme-aspect-ratio single wing, slender fuselage pod, T-tail, prop array.
+ */
 function Haps({ s, color }: { s: number; color: string }) {
   const ref = useRef<THREE.Group>(null);
   useFrame(({ clock }) => {
-    if (ref.current) {
-      ref.current.rotation.y = Math.sin(clock.elapsedTime * 0.25) * 0.5;
-      ref.current.position.y = Math.sin(clock.elapsedTime * 0.7) * s * 0.15;
-    }
+    const t = clock.elapsedTime;
+    if (!ref.current) return;
+    // wide, slow station-keeping orbit with a gentle bank
+    ref.current.rotation.y = t * 0.16;
+    ref.current.rotation.z = 0.12;
+    ref.current.position.y = Math.sin(t * 0.35) * s * 0.08;
+  });
+  const span = s * 3.4;
+  return (
+    <group ref={ref}>
+      {/* high-aspect-ratio wing with solar-cell upper surface */}
+      <mesh>
+        <boxGeometry args={[span, s * 0.035, s * 0.34]} />
+        <meshStandardMaterial color="#e7edf3" metalness={0.2} roughness={0.55} />
+      </mesh>
+      <mesh position={[0, s * 0.026, 0]}>
+        <boxGeometry args={[span * 0.97, s * 0.008, s * 0.28]} />
+        <meshStandardMaterial {...SOLAR} />
+      </mesh>
+      {/* slender fuselage pod */}
+      <mesh position={[0, -s * 0.07, s * 0.06]} rotation={[Math.PI / 2, 0, 0]}>
+        <capsuleGeometry args={[s * 0.07, s * 0.72, 3, 8]} />
+        <meshStandardMaterial {...HULL} />
+      </mesh>
+      {/* tail boom + T-tail */}
+      <mesh position={[0, -s * 0.05, -s * 0.62]} rotation={[Math.PI / 2, 0, 0]}>
+        <cylinderGeometry args={[s * 0.022, s * 0.022, s * 0.8, 6]} />
+        <meshStandardMaterial {...DARK_HULL} />
+      </mesh>
+      <mesh position={[0, s * 0.14, -s * 1]}>
+        <boxGeometry args={[s * 0.03, s * 0.28, s * 0.16]} />
+        <meshStandardMaterial {...HULL} />
+      </mesh>
+      <mesh position={[0, s * 0.27, -s * 1]}>
+        <boxGeometry args={[s * 0.8, s * 0.02, s * 0.16]} />
+        <meshStandardMaterial {...HULL} />
+      </mesh>
+      {/* distributed electric propulsion */}
+      {[-1.25, -0.55, 0.55, 1.25].map((x) => (
+        <group key={x} position={[s * x, -s * 0.01, s * 0.24]}>
+          <mesh rotation={[Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[s * 0.035, s * 0.035, s * 0.14, 6]} />
+            <meshStandardMaterial {...DARK_HULL} />
+          </mesh>
+          <group position={[0, 0, s * 0.09]}>
+            <Prop r={s * 0.17} speed={12} thick={s * 0.018} />
+          </group>
+        </group>
+      ))}
+      {/* belly comms payload */}
+      <mesh position={[0, -s * 0.16, s * 0.06]}>
+        <sphereGeometry args={[s * 0.075, 10, 8]} />
+        <meshStandardMaterial color={color} metalness={0.4} roughness={0.4} />
+      </mesh>
+    </group>
+  );
+}
+
+/**
+ * Relay UAV — compact low-altitude fixed-wing aircraft: short stubby wings,
+ * pusher prop, V-tail. Deliberately distinct from the HAPS glider.
+ */
+function Drone({ s, color }: { s: number; color: string }) {
+  const ref = useRef<THREE.Group>(null);
+  useFrame(({ clock }) => {
+    const t = clock.elapsedTime;
+    if (!ref.current) return;
+    ref.current.rotation.y = t * 0.55; // tight loiter orbit
+    ref.current.rotation.z = 0.28; // banked into the turn
   });
   return (
     <group ref={ref}>
-      {/* stratospheric wing */}
-      <mesh scale={[3.1, 0.3, 0.85]}>
-        <sphereGeometry args={[s * 0.62, 16, 12]} />
-        <meshBasicMaterial color={color} />
-      </mesh>
-      {/* twin gondolas */}
-      {[-1, 1].map((dir) => (
-        <mesh key={dir} position={[dir * s * 0.8, -s * 0.32, 0]}>
-          <capsuleGeometry args={[s * 0.11, s * 0.34, 4, 8]} />
-          <meshBasicMaterial color="#bae6fd" />
-        </mesh>
-      ))}
-      {/* tail fin */}
-      <mesh position={[0, s * 0.2, -s * 0.5]}>
-        <boxGeometry args={[s * 0.06, s * 0.42, s * 0.3]} />
-        <meshBasicMaterial color="#bae6fd" />
-      </mesh>
-      {/* station-keeping footprint */}
+      {/* fuselage */}
       <mesh rotation={[Math.PI / 2, 0, 0]}>
-        <torusGeometry args={[s * 1.5, s * 0.02, 6, 32]} />
-        <meshBasicMaterial color={color} transparent opacity={0.35} />
+        <capsuleGeometry args={[s * 0.14, s * 0.72, 4, 10]} />
+        <meshStandardMaterial color="#c3ccd6" metalness={0.45} roughness={0.5} />
       </mesh>
-    </group>
-  );
-}
-
-function Drone({ s, color }: { s: number; color: string }) {
-  const rotors = useRef<THREE.Group>(null);
-  useFrame((_, d) => {
-    if (rotors.current) rotors.current.rotation.y += d * 6;
-  });
-  const arms: [number, number][] = [
-    [1, 1],
-    [1, -1],
-    [-1, 1],
-    [-1, -1],
-  ];
-  return (
-    <group>
-      <mesh>
-        <boxGeometry args={[s * 0.55, s * 0.28, s * 0.55]} />
-        <meshBasicMaterial color={color} />
+      {/* nose sensor turret */}
+      <mesh position={[0, -s * 0.1, s * 0.42]}>
+        <sphereGeometry args={[s * 0.1, 10, 8]} />
+        <meshStandardMaterial color="#3b4652" metalness={0.5} roughness={0.35} />
       </mesh>
-      {[0, Math.PI / 2].map((r) => (
-        <mesh key={r} rotation={[0, r, 0]}>
-          <boxGeometry args={[s * 2, s * 0.05, s * 0.07]} />
-          <meshBasicMaterial color="#c7d2fe" />
+      {/* short straight wings */}
+      <mesh position={[0, s * 0.05, s * 0.02]}>
+        <boxGeometry args={[s * 1.7, s * 0.035, s * 0.26]} />
+        <meshStandardMaterial color="#e7edf3" metalness={0.25} roughness={0.55} />
+      </mesh>
+      {/* winglets */}
+      {[-1, 1].map((dir) => (
+        <mesh key={dir} position={[dir * s * 0.84, s * 0.12, s * 0.02]}>
+          <boxGeometry args={[s * 0.025, s * 0.16, s * 0.2]} />
+          <meshStandardMaterial {...HULL} />
         </mesh>
       ))}
-      <group ref={rotors}>
-        {arms.map(([x, z]) => (
-          <mesh
-            key={`${x}${z}`}
-            position={[x * s * 0.72, s * 0.06, z * s * 0.72]}
-            rotation={[Math.PI / 2, 0, 0]}
-          >
-            <torusGeometry args={[s * 0.34, s * 0.02, 5, 16]} />
-            <meshBasicMaterial color="#e0e7ff" transparent opacity={0.85} />
+      {/* V-tail */}
+      {[-1, 1].map((dir) => (
+        <mesh key={dir} position={[dir * s * 0.16, s * 0.12, -s * 0.44]} rotation={[0, 0, dir * 0.7]}>
+          <boxGeometry args={[s * 0.04, s * 0.34, s * 0.18]} />
+          <meshStandardMaterial {...HULL} />
+        </mesh>
+      ))}
+      {/* pusher prop */}
+      <group position={[0, 0, -s * 0.56]}>
+        <Prop r={s * 0.22} speed={26} thick={s * 0.022} />
+      </group>
+      {/* belly relay antenna */}
+      <mesh position={[0, -s * 0.18, -s * 0.05]}>
+        <cylinderGeometry args={[s * 0.07, s * 0.09, s * 0.1, 8]} />
+        <meshStandardMaterial color={color} metalness={0.4} roughness={0.4} />
+      </mesh>
+    </group>
+  );
+}
+
+/**
+ * Ground station — concrete pad, equipment shelter and a steerable parabolic
+ * dish on an elevation/azimuth pedestal, tracking the active link.
+ */
+function GroundStation({ s, color }: { s: number; color: string }) {
+  const az = useRef<THREE.Group>(null);
+  const el = useRef<THREE.Group>(null);
+  useFrame(({ clock }) => {
+    const t = clock.elapsedTime;
+    // slow az/el tracking sweep toward the overhead link
+    if (az.current) az.current.rotation.y = Math.sin(t * 0.16) * 0.9;
+    if (el.current) el.current.rotation.x = -0.95 + Math.sin(t * 0.11) * 0.18;
+  });
+  return (
+    <group>
+      {/* concrete pad */}
+      <mesh position={[0, s * 0.03, 0]} receiveShadow>
+        <cylinderGeometry args={[s * 0.95, s * 1, s * 0.06, 16]} />
+        <meshStandardMaterial {...CONCRETE} />
+      </mesh>
+      {/* equipment shelter + mast */}
+      <mesh position={[s * 0.6, s * 0.16, s * 0.25]} castShadow>
+        <boxGeometry args={[s * 0.34, s * 0.2, s * 0.26]} />
+        <meshStandardMaterial color="#9aa5b1" metalness={0.3} roughness={0.7} />
+      </mesh>
+      <mesh position={[-s * 0.62, s * 0.3, -s * 0.2]}>
+        <cylinderGeometry args={[s * 0.015, s * 0.015, s * 0.55, 5]} />
+        <meshStandardMaterial {...DARK_HULL} />
+      </mesh>
+
+      {/* az/el pedestal */}
+      <group ref={az} position={[0, s * 0.06, 0]}>
+        <mesh position={[0, s * 0.16, 0]} castShadow>
+          <cylinderGeometry args={[s * 0.11, s * 0.16, s * 0.32, 10]} />
+          <meshStandardMaterial {...HULL} />
+        </mesh>
+        <group ref={el} position={[0, s * 0.36, 0]}>
+          {/* parabolic reflector */}
+          <mesh castShadow>
+            <sphereGeometry args={[s * 0.5, 20, 10, 0, Math.PI * 2, 0, 0.78]} />
+            <meshStandardMaterial
+              color="#eef3f8"
+              metalness={0.35}
+              roughness={0.3}
+              side={THREE.DoubleSide}
+            />
           </mesh>
-        ))}
+          {/* feed support struts + feed horn */}
+          {[0, 2.1, 4.2].map((a) => (
+            <mesh
+              key={a}
+              position={[Math.cos(a) * s * 0.2, s * 0.24, Math.sin(a) * s * 0.2]}
+              rotation={[0, 0, Math.cos(a) * 0.35]}
+            >
+              <cylinderGeometry args={[s * 0.012, s * 0.012, s * 0.42, 4]} />
+              <meshStandardMaterial {...DARK_HULL} />
+            </mesh>
+          ))}
+          <mesh position={[0, s * 0.44, 0]}>
+            <cylinderGeometry args={[s * 0.05, s * 0.07, s * 0.12, 8]} />
+            <meshStandardMaterial color={color} metalness={0.5} roughness={0.35} />
+          </mesh>
+        </group>
       </group>
     </group>
   );
 }
 
-function GroundStation({ s, color }: { s: number; color: string }) {
-  const dish = useRef<THREE.Group>(null);
-  useFrame(({ clock }) => {
-    if (dish.current) dish.current.rotation.y = Math.sin(clock.elapsedTime * 0.2) * 0.7;
-  });
-  return (
-    <group>
-      {/* pad */}
-      <mesh position={[0, s * 0.05, 0]}>
-        <cylinderGeometry args={[s * 0.95, s * 1.05, s * 0.12, 12]} />
-        <meshBasicMaterial color="#0f766e" />
-      </mesh>
-      <group ref={dish} position={[0, s * 0.4, 0]}>
-        {/* mast */}
-        <mesh position={[0, -s * 0.18, 0]}>
-          <cylinderGeometry args={[s * 0.09, s * 0.11, s * 0.5, 8]} />
-          <meshBasicMaterial color="#5eead4" />
-        </mesh>
-        {/* parabolic dish, tilted skyward */}
-        <mesh rotation={[-0.75, 0, 0]}>
-          <coneGeometry args={[s * 0.85, s * 0.6, 18, 1, true]} />
-          <meshBasicMaterial color={color} side={THREE.DoubleSide} />
-        </mesh>
-        {/* feed horn */}
-        <mesh position={[0, s * 0.36, s * 0.3]}>
-          <sphereGeometry args={[s * 0.1, 8, 8]} />
-          <meshBasicMaterial color="#ecfeff" />
-        </mesh>
-      </group>
-    </group>
-  );
-}
 
 function CustomerNode({ s, color }: { s: number; color: string }) {
   const ring = useRef<THREE.Mesh>(null);
@@ -946,6 +1496,8 @@ function AssetNode({
   showLabel,
   live,
   linking,
+  tether,
+  detail,
 }: {
   asset: Asset;
   selected: boolean;
@@ -955,6 +1507,10 @@ function AssetNode({
   live: LiveMap;
   /** node is inside an active communication window */
   linking?: boolean;
+  /** draw a plumb line down to the surface so altitude is readable */
+  tether?: boolean;
+  /** show the altitude-layer caption under the name */
+  detail?: boolean;
 }) {
   const [hover, setHover] = useState(false);
   const position = useMemo(() => vec(asset), [asset]);
@@ -967,12 +1523,20 @@ function AssetNode({
 
   const s =
     asset.kind === 'satellite'
-      ? 0.019
+      ? 0.021
       : asset.kind === 'haps'
-        ? 0.017
+        ? 0.018
         : asset.kind === 'drone'
-          ? 0.014
+          ? 0.013
           : 0.015;
+
+  /** plumb line from the asset's shell down to the surface below it */
+  const tetherGeom = useMemo(() => {
+    if (!tether || asset.altKm <= 0) return null;
+    const top = new THREE.Vector3(0, 0, 0);
+    const bottom = new THREE.Vector3(0, -(layerRadius(asset) - 1), 0);
+    return new THREE.BufferGeometry().setFromPoints([top, bottom]);
+  }, [tether, asset]);
 
   useFrame(({ clock, camera }) => {
     if (root.current) {
@@ -994,6 +1558,48 @@ function AssetNode({
         (1 - p) * (selected ? 0.55 : linking ? 0.42 : onRoute ? 0.28 : 0);
     }
   });
+
+  /* label rendering is delegated to the decluttered screen-space layer */
+  useLabel(
+    showLabel || hover || selected
+      ? {
+          id: `asset-${asset.id}`,
+          text: asset.name,
+          sub: `${LAYER[asset.kind].label} · ${LAYER[asset.kind].altitude}`,
+          detail: [
+            asset.role,
+            `${asset.health} · ${asset.altKm > 0 ? `${asset.altKm} km` : 'surface'}`,
+            linking ? 'Comm window active' : '',
+          ].filter(Boolean) as string[],
+          color: LAYER[asset.kind].color,
+          priority: selected
+            ? 130
+            : hover
+              ? 120
+              : onRoute
+                ? 70
+                : linking
+                  ? 60
+                  : asset.kind === 'ground'
+                    ? 45
+                    : asset.kind === 'satellite'
+                      ? 30
+                      : 25,
+          minTier:
+            asset.kind === 'satellite' || asset.kind === 'ground'
+              ? 'global'
+              : asset.kind === 'customer'
+                ? 'local'
+                : 'regional',
+          emphasis: selected || hover || onRoute,
+          getPosition: (out) => {
+            const p = live.get(asset.id);
+            if (!p) return null;
+            return out.copy(p).setLength(p.length() + s * 3.4);
+          },
+        }
+      : null
+  );
 
   return (
     <group ref={root} position={position} quaternion={quat}>
@@ -1037,17 +1643,18 @@ function AssetNode({
         />
       </mesh>
 
-      {(showLabel || hover || selected) && (
-        <Html center distanceFactor={1.6} position={[0, s * 4.4, 0]} zIndexRange={[20, 0]}>
-          <div
-            className={`pointer-events-none select-none whitespace-nowrap font-mono text-[9px] uppercase tracking-[0.18em] transition-opacity ${
-              selected || hover ? 'text-foreground' : 'text-foreground/55'
-            }`}
-          >
-            {asset.name}
-          </div>
-        </Html>
+      {tetherGeom && (
+        // @ts-expect-error three line primitive
+        <line geometry={tetherGeom}>
+          <lineBasicMaterial
+            color={KIND_COLOR[asset.kind]}
+            transparent
+            opacity={selected || onRoute ? 0.28 : 0.12}
+            depthWrite={false}
+          />
+        </line>
       )}
+
     </group>
   );
 }
@@ -1142,6 +1749,190 @@ function AffectedFootprint({ cell, color }: { cell: WeatherCell; color: string }
 }
 
 
+/* ------------------------------------------------ global-view abstractions */
+
+/** Operational region badge shown when the Earth is viewed from far away. */
+function RegionMarker({
+  region,
+  counts,
+  onFocus,
+}: {
+  region: RegionDef;
+  counts: { assets: number; ground: number };
+  onFocus: (r: RegionDef) => void;
+}) {
+  const [hover, setHover] = useState(false);
+  const position = useMemo(
+    () => new THREE.Vector3(...geoOnShell(region.lat, region.lon, 1.004)),
+    [region]
+  );
+  const quat = useMemo(() => {
+    const q = new THREE.Quaternion();
+    q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), position.clone().normalize());
+    return q;
+  }, [position]);
+  const pulse = useRef<THREE.Mesh>(null);
+  const r = region.spread;
+
+  useFrame(({ clock }) => {
+    if (!pulse.current) return;
+    const t = (clock.elapsedTime * 0.45) % 1;
+    pulse.current.scale.setScalar(0.7 + t * 0.9);
+    (pulse.current.material as THREE.MeshBasicMaterial).opacity = (1 - t) * 0.5;
+  });
+
+  return (
+    <group position={position} quaternion={quat}>
+      <mesh
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHover(true);
+        }}
+        onPointerOut={() => setHover(false)}
+        onClick={(e: ThreeEvent<MouseEvent>) => {
+          e.stopPropagation();
+          onFocus(region);
+        }}
+      >
+        <circleGeometry args={[r * 1.15, 40]} />
+        <meshBasicMaterial color={CYAN} transparent opacity={hover ? 0.12 : 0.05} depthWrite={false} />
+      </mesh>
+      <mesh>
+        <ringGeometry args={[r * 0.94, r, 64]} />
+        <meshBasicMaterial color={CYAN} transparent opacity={0.55} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      <mesh ref={pulse}>
+        <ringGeometry args={[r * 0.97, r, 64]} />
+        <meshBasicMaterial color={CYAN} transparent opacity={0.4} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+    </group>
+  );
+}
+
+/** Simplified trunk corridor between two operational regions (global view). */
+function TrunkRoute({ a, b }: { a: RegionDef; b: RegionDef }) {
+  const curve = useMemo(() => {
+    const p = new THREE.Vector3(...geoOnShell(a.lat, a.lon, 1.01));
+    const q = new THREE.Vector3(...geoOnShell(b.lat, b.lon, 1.01));
+    const mid = p.clone().add(q).multiplyScalar(0.5).setLength(1.42);
+    return new THREE.QuadraticBezierCurve3(p, mid, q);
+  }, [a, b]);
+  const packs = useRef<THREE.Group>(null);
+  const t = useRef(0);
+
+  useFrame((_, d) => {
+    t.current = (t.current + d * 0.13) % 1;
+    packs.current?.children.forEach((child, i) => {
+      const p = (t.current + i / 3) % 1;
+      child.position.copy(curve.getPointAt(p));
+      const mat = (child as THREE.Mesh).material as THREE.MeshBasicMaterial;
+      mat.opacity = Math.sin(p * Math.PI) * 0.9;
+    });
+  });
+
+  return (
+    <group>
+      <mesh>
+        <tubeGeometry args={[curve, 64, 0.0035, 6, false]} />
+        <meshBasicMaterial color="#38bdf8" transparent opacity={0.35} depthWrite={false} />
+      </mesh>
+      <group ref={packs}>
+        {[0, 1, 2].map((i) => (
+          <mesh key={i}>
+            <sphereGeometry args={[0.008, 8, 8]} />
+            <meshBasicMaterial color="#e0f2fe" transparent opacity={0.8} depthWrite={false} />
+          </mesh>
+        ))}
+      </group>
+    </group>
+  );
+}
+
+/* ------------------------------------------------ vertical layer scaffold */
+
+/**
+ * The altitude ladder over an operational region: one disc per visual layer
+ * plus a vertical spine, so the operator can read which shell an asset is on.
+ */
+function LayerScaffold({ region, detailed }: { region: RegionDef; detailed: boolean }) {
+  const normal = useMemo(
+    () => new THREE.Vector3(...geoOnShell(region.lat, region.lon, 1)).normalize(),
+    [region]
+  );
+  const quat = useMemo(
+    () => new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal),
+    [normal]
+  );
+
+  const spine = useMemo(() => {
+    const pts = [
+      normal.clone().multiplyScalar(1.0),
+      normal.clone().multiplyScalar(LAYER.satellite.radius + 0.03),
+    ];
+    return new THREE.BufferGeometry().setFromPoints(pts);
+  }, [normal]);
+
+  return (
+    <group>
+      {/* @ts-expect-error three line primitive */}
+      <line geometry={spine}>
+        <lineDashedMaterial color="#7dd3fc" transparent opacity={0.16} depthWrite={false} />
+      </line>
+
+      {LAYER_STACK.map((kind) => {
+        const def = LAYER[kind];
+        const r = def.radius;
+        const disc = region.spread * (0.9 + (r - 1) * 1.5);
+        const center = normal.clone().multiplyScalar(r);
+        return (
+          <group key={kind} position={center} quaternion={quat}>
+            <mesh>
+              <ringGeometry args={[disc * 0.985, disc, 72]} />
+              <meshBasicMaterial
+                color={def.color}
+                transparent
+                opacity={0.26}
+                side={THREE.DoubleSide}
+                depthWrite={false}
+              />
+            </mesh>
+            <mesh>
+              <circleGeometry args={[disc, 48]} />
+              <meshBasicMaterial
+                color={def.color}
+                transparent
+                opacity={0.035}
+                side={THREE.DoubleSide}
+                depthWrite={false}
+              />
+            </mesh>
+            {detailed && (
+              <Html
+                center
+                distanceFactor={1.5}
+                position={[-disc * 1.22, 0, 0]}
+                zIndexRange={[14, 0]}
+              >
+                <div className="pointer-events-none whitespace-nowrap text-right font-mono uppercase">
+                  <div
+                    className="text-[9px] tracking-[0.2em]"
+                    style={{ color: def.color, opacity: 0.9 }}
+                  >
+                    {def.label}
+                  </div>
+                  <div className="text-[8px] tracking-[0.18em] text-foreground/40">
+                    {def.altitude}
+                  </div>
+                </div>
+              </Html>
+            )}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
 /* --------------------------------------------------------- camera focus */
 
 function CameraRig({
@@ -1149,11 +1940,16 @@ function CameraRig({
   live,
   approach,
   controls,
+  view,
+  onArrive,
 }: {
   focusIds: string[] | null;
   live: LiveMap;
   approach: number;
   controls: React.RefObject<any>;
+  /** one-shot smooth transition to a pre-designed readable framing */
+  view: CameraView | null;
+  onArrive: () => void;
 }) {
   const desired = useRef(new THREE.Vector3());
   const target = useRef(new THREE.Vector3());
@@ -1161,6 +1957,20 @@ function CameraRig({
     const c = controls.current;
     if (!c) return;
     const k = 1 - Math.exp(-2.6 * d);
+
+    if (view) {
+      c.target.lerp(view.target, k * 0.9);
+      camera.position.lerp(view.position, k * 0.85);
+      c.update();
+      if (
+        camera.position.distanceTo(view.position) < 0.03 &&
+        c.target.distanceTo(view.target) < 0.03
+      ) {
+        onArrive();
+      }
+      return;
+    }
+
     if (focusIds && focusIds.length) {
       target.current.set(0, 0, 0);
       let n = 0;
@@ -1175,8 +1985,9 @@ function CameraRig({
       target.current.multiplyScalar(1 / n);
       const t = target.current;
       c.target.lerp(t, k);
-      const dist = Math.max(1.42, t.length() + approach);
-      desired.current.copy(t).setLength(dist);
+      // rotate + zoom so the selection sits clearly off the limb, never edge-on
+      const dist = Math.max(1.52, t.length() + approach);
+      stationInto(desired.current, t, dist, 18, 10);
       camera.position.lerp(desired.current, k * 0.95);
     } else {
       c.target.lerp(new THREE.Vector3(0, 0, 0), k * 0.6);
@@ -1188,7 +1999,19 @@ function CameraRig({
 
 /* ------------------------------------------------------------ the scene */
 
-function SceneContent({ state }: { state: OloLinkState }) {
+function SceneContent({
+  state,
+  onLod,
+  preset,
+  presetSeq,
+  onPresetDone,
+}: {
+  state: OloLinkState;
+  onLod: (s: LodState) => void;
+  preset: PresetId | null;
+  presetSeq: number;
+  onPresetDone: () => void;
+}) {
   const { profile, links, selection, select, layers, route, previousRoute, rerouteSeq } = state;
   const controls = useRef<any>(null);
 
@@ -1224,6 +2047,109 @@ function SceneContent({ state }: { state: OloLinkState }) {
 
   const approach = selection?.type === 'asset' ? 0.42 : 0.85;
 
+  /* ------------------------------------------------------ level of detail */
+
+  const [lod, setLod] = useState<LodState>({ level: 'global', region: null });
+  const [view, setView] = useState<CameraView | null>(null);
+
+  useEffect(() => {
+    onLod(lod);
+  }, [lod, onLod]);
+
+  /* smart camera presets -> a pre-designed readable framing */
+  useEffect(() => {
+    if (!preset) return;
+    if (preset === 'active-link') {
+      const points: THREE.Vector3[] = [];
+      for (const id of profile.route) {
+        const p = live.get(id);
+        if (p) points.push(p.clone());
+      }
+      const v = fitView(points, 20);
+      if (v) setView(v);
+    } else {
+      const v = presetView(preset);
+      if (v) setView(v);
+    }
+    select(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preset, presetSeq]);
+
+  /** the region the operator is working in: camera-derived, or the selection's */
+  const activeRegion = useMemo(() => {
+    if (selection?.type === 'asset') {
+      const r = ASSET_BY_ID[selection.id];
+      if (r) return regionIdOf(r) ?? lod.region;
+    }
+    return lod.region;
+  }, [selection, lod.region]);
+
+  const detailed = lod.level !== 'global';
+  const localView = lod.level === 'local';
+
+  const inScope = useMemo(
+    () => (regionId: string | null) => !activeRegion || regionId === activeRegion,
+    [activeRegion]
+  );
+
+  /** progressive reveal: only surface + orbital tiers exist at global range */
+  const visibleAssets = useMemo(
+    () =>
+      ASSETS.filter((a) => {
+        const region = regionIdOf(a);
+        if (a.kind === 'satellite') return true;
+        if (a.kind === 'ground') return true;
+        if (!detailed) return false;
+        return inScope(region);
+      }),
+    [detailed, inScope]
+  );
+  const visibleIds = useMemo(() => new Set(visibleAssets.map((a) => a.id)), [visibleAssets]);
+
+  const visibleLinks = useMemo(
+    () =>
+      links.filter((l) => {
+        const from = ASSET_BY_ID[l.segment.from];
+        const to = ASSET_BY_ID[l.segment.to];
+        if (!from || !to) return false;
+        if (!visibleIds.has(from.id) || !visibleIds.has(to.id)) return false;
+        // at global range only the primary space-to-ground path is drawn
+        if (!detailed) return from.kind === 'satellite' && to.kind === 'ground';
+        return true;
+      }),
+    [links, visibleIds, detailed]
+  );
+
+  const scopedRegions = useMemo(
+    () => REGIONS.filter((r) => inScope(r.id)),
+    [inScope]
+  );
+
+  const visibleWeather = useMemo(() => {
+    if (!detailed) return [];
+    const cells = profile.weather.length ? profile.weather : AMBIENT_CELLS;
+    return cells.filter((c) => {
+      if (!activeRegion) return true;
+      const r = REGION_BY_ID[activeRegion];
+      if (!r) return true;
+      return Math.abs(c.lat - r.lat) < 25 && Math.abs(c.lon - r.lon) < 30;
+    });
+  }, [profile.weather, detailed, activeRegion]);
+
+  const regionCounts = useMemo(
+    () =>
+      Object.fromEntries(
+        REGIONS.map((r) => [
+          r.id,
+          {
+            assets: ASSETS.filter((a) => a.region === r.name).length,
+            ground: ASSETS.filter((a) => a.region === r.name && a.kind === 'ground').length,
+          },
+        ])
+      ) as Record<string, { assets: number; ground: number }>,
+    []
+  );
+
   return (
     <>
       {/* sun: gives a visible day / night terminator across both regions */}
@@ -1241,6 +2167,7 @@ function SceneContent({ state }: { state: OloLinkState }) {
       />
       <Stars radius={90} depth={40} count={2200} factor={2.6} saturation={0} fade speed={0.3} />
 
+      <LodDriver onChange={setLod} />
 
       <Suspense fallback={null}>
         <Earth />
@@ -1248,10 +2175,36 @@ function SceneContent({ state }: { state: OloLinkState }) {
 
       <OrbitDriver state={state} live={live} />
 
+      {/* live pass contacts: any LEO overhead a receiver transmits immediately */}
+      {layers.routes && <PassNetwork live={live} running={state.running} />}
+
       {layers.orbits && SATELLITES.map((a) => <OrbitTrack key={a.id} elId={a.id} />)}
 
+      {/* GLOBAL — operational regions and the trunk between them */}
+      <Fade show={!detailed}>
+        {REGIONS.map((r) => (
+          <RegionMarker
+            key={r.id}
+            region={r}
+            counts={regionCounts[r.id]!}
+            onFocus={(reg) => {
+              select(null);
+              setView(presetView(reg.id as PresetId) ?? pointView(new THREE.Vector3(...geoOnShell(reg.lat, reg.lon, 1.06)), 1.95, 24));
+            }}
+          />
+        ))}
+        {REGIONS[0] && REGIONS[1] && <TrunkRoute a={REGIONS[0]} b={REGIONS[1]} />}
+      </Fade>
+
+      {/* REGIONAL / LOCAL — altitude ladder above the operational region */}
+      <Fade show={detailed}>
+        {scopedRegions.map((r) => (
+          <LayerScaffold key={r.id} region={r} detailed={localView} />
+        ))}
+      </Fade>
+
       {layers.routes &&
-        links.map((l) =>
+        visibleLinks.map((l) =>
           ASSET_BY_ID[l.segment.from]?.kind === 'satellite' ? (
             <DownlinkBeam
               key={l.segment.id}
@@ -1275,7 +2228,7 @@ function SceneContent({ state }: { state: OloLinkState }) {
         )}
 
       {/* AI rerouting: old path dissolves, new path draws itself in */}
-      {layers.routes && previousRoute && previousRoute.length > 0 && (
+      {layers.routes && detailed && previousRoute && previousRoute.length > 0 && (
         <>
           <ProgressiveRoute
             key={`out-${rerouteSeq}`}
@@ -1294,20 +2247,27 @@ function SceneContent({ state }: { state: OloLinkState }) {
         </>
       )}
 
-      {ASSETS.map((a) => (
+      {visibleAssets.map((a) => (
         <AssetNode
           key={a.id}
           asset={a}
           selected={selection?.type === 'asset' && selection.id === a.id}
           onRoute={routeAssets.has(a.id)}
           onSelect={select}
-          showLabel={layers.labels && (routeAssets.has(a.id) || windowSats.has(a.id))}
+          showLabel={
+            layers.labels &&
+            (detailed
+              ? routeAssets.has(a.id) || windowSats.has(a.id) || a.kind !== 'satellite'
+              : routeAssets.has(a.id) && a.kind === 'satellite')
+          }
+          detail={localView}
+          tether={detailed && a.altKm > 0 && a.kind !== 'satellite'}
           live={live}
           linking={windowSats.has(a.id) || windowReceivers.has(a.id)}
         />
       ))}
 
-      {layers.weather && profile.weather.map((c) => <WeatherBlob key={c.id} cell={c} />)}
+      {layers.weather && visibleWeather.map((c) => <WeatherBlob key={c.id} cell={c} />)}
 
       <OrbitControls
         ref={controls}
@@ -1315,29 +2275,61 @@ function SceneContent({ state }: { state: OloLinkState }) {
         enableDamping
         dampingFactor={0.08}
         rotateSpeed={0.45}
-        minDistance={1.18}
-        maxDistance={5}
-        autoRotate={!selection && state.running}
+        minDistance={1.32}
+        maxDistance={5.2}
+        autoRotate={!selection && !view && lod.level === 'global' && state.running}
         autoRotateSpeed={0.22}
       />
-      <CameraRig focusIds={focus} live={live} approach={approach} controls={controls} />
+      <CameraRig
+        focusIds={view ? null : focus}
+        live={live}
+        approach={approach}
+        controls={controls}
+        view={view}
+        onArrive={() => {
+          setView(null);
+          onPresetDone();
+        }}
+      />
+      <LabelProjector tier={lod.level} />
     </>
   );
 }
 
+
+
 export function GlobeScene({ state }: { state: OloLinkState }) {
+  const [lod, setLod] = useState<LodState>({ level: 'global', region: null });
+  const onLod = useMemo(() => (s: LodState) => setLod(s), []);
+  const [preset, setPreset] = useState<PresetId | null>(null);
+  const [presetSeq] = useState(0);
+
+
   return (
-    <Canvas
-      /* framed over the Pacific so both Thailand and the United States are in view */
-      camera={{ position: [-2.807, 1.31, -0.123], fov: 42 }}
-      dpr={[1, 2]}
-      gl={{ antialias: true }}
-      onPointerMissed={() => state.select(null)}
-      className="!absolute inset-0"
-    >
-      <color attach="background" args={['#000000']} />
-      <SceneContent state={state} />
-    </Canvas>
+    <LabelLayer tier={lod.level}>
+      <Canvas
+        /* framed over the Pacific so both Thailand and the United States are in view */
+        camera={{ position: [OPERATIONAL_VIEW.position.x, OPERATIONAL_VIEW.position.y, OPERATIONAL_VIEW.position.z], fov: 42 }}
+        dpr={[1, 2]}
+        gl={{ antialias: true }}
+        onPointerMissed={() => state.select(null)}
+        className="!absolute inset-0"
+      >
+        <color attach="background" args={['#000000']} />
+        <LodContext.Provider value={lod}>
+          <SceneContent
+            state={state}
+            onLod={onLod}
+            preset={preset}
+            presetSeq={presetSeq}
+            onPresetDone={() => setPreset(null)}
+          />
+        </LodContext.Provider>
+      </Canvas>
+
+
+
+    </LabelLayer>
   );
 }
 
