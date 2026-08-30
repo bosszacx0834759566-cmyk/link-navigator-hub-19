@@ -94,31 +94,166 @@ export const KIND_META: Record<AssetKind, { label: string; plural: string }> = {
   customer: { label: 'Customer Network', plural: 'Customer Networks' },
 };
 
+/** Deterministic pseudo-random generator so the generated fleet is stable
+ *  across reloads (no Math.random — keeps SSR/CSR markup identical). */
+function mulberry32(seed: number) {
+  let a = seed;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const FLEET_REGIONS = [
+  'Thailand',
+  'United States',
+  'Pacific',
+  'Atlantic',
+  'Eurasia',
+  'Europe',
+  'South America',
+  'Africa',
+  'Indian Ocean',
+  'Australia',
+];
+
+interface FleetSpec {
+  kind: AssetKind;
+  prefix: string;
+  count: number;
+  startIndex: number;
+  altMin: number;
+  altMax: number;
+  latMin: number;
+  latMax: number;
+  role: string;
+  seed: number;
+}
+
+/** Generate `count` assets spread around the globe with realistic altitudes. */
+function generateFleet(spec: FleetSpec): Asset[] {
+  const rand = mulberry32(spec.seed);
+  const out: Asset[] = [];
+  for (let i = 0; i < spec.count; i++) {
+    const n = spec.startIndex + i;
+    // Spread longitudes evenly with jitter; latitudes random within band.
+    const lon = -180 + ((i + 0.5) / spec.count) * 360 + (rand() - 0.5) * 14;
+    const lat = spec.latMin + rand() * (spec.latMax - spec.latMin);
+    const altKm = +(spec.altMin + rand() * (spec.altMax - spec.altMin)).toFixed(1);
+    const region = FLEET_REGIONS[i % FLEET_REGIONS.length]!;
+    // a few non-nominal units for realism
+    const health: Health = rand() < 0.88 ? 'NOMINAL' : rand() < 0.75 ? 'DEGRADED' : 'OFFLINE';
+    out.push({
+      id: `${spec.kind}-gen-${n}`,
+      name: `${spec.prefix}-${n}`,
+      kind: spec.kind,
+      lat: +lat.toFixed(2),
+      lon: +(((lon + 540) % 360) - 180).toFixed(2),
+      altKm,
+      role: `${spec.role} (${region})`,
+      region,
+      health,
+    });
+  }
+  return out;
+}
+
+/** ~1 degree latitude ≈ 111 km; used to place cluster members km-accurately. */
+const KM_PER_DEG = 111;
+
+/**
+ * Generate co-located operation sites: each site N is a cluster of
+ * HAPS-N (18–20 km, above the cloud deck), Drone-N (below the clouds,
+ * 2–5 km horizontally from its HAPS) and GS-N (10–15 km from the drone).
+ * Sites themselves are spread around the globe for worldwide coverage.
+ */
+function generateSites(count: number, startIndex: number, seed: number): Asset[] {
+  const rand = mulberry32(seed);
+  const out: Asset[] = [];
+  for (let i = 0; i < count; i++) {
+    const n = startIndex + i;
+    const region = FLEET_REGIONS[i % FLEET_REGIONS.length]!;
+    const healthOf = (): Health => (rand() < 0.88 ? 'NOMINAL' : rand() < 0.75 ? 'DEGRADED' : 'OFFLINE');
+
+    // Ground station anchor — sites spread across longitudes, mid-latitudes.
+    const gsLon = -180 + ((i + 0.5) / count) * 360 + (rand() - 0.5) * 14;
+    const gsLat = -45 + rand() * 100;
+
+    // Drone: 10–15 km from the ground station, below the cloud deck (3–6 km alt).
+    const dBearing = rand() * Math.PI * 2;
+    const dDistKm = 10.5 + rand() * 4;
+    const drnLat = gsLat + (Math.cos(dBearing) * dDistKm) / KM_PER_DEG;
+    const drnLon = gsLon + (Math.sin(dBearing) * dDistKm) / (KM_PER_DEG * Math.cos((gsLat * Math.PI) / 180));
+    const drnAlt = +(3 + rand() * 3).toFixed(1);
+
+    // HAPS: 2–5 km horizontally from its drone, in the stratosphere above clouds.
+    const hBearing = rand() * Math.PI * 2;
+    const hDistKm = 2.5 + rand() * 2;
+    const hapsLat = drnLat + (Math.cos(hBearing) * hDistKm) / KM_PER_DEG;
+    const hapsLon = drnLon + (Math.sin(hBearing) * hDistKm) / (KM_PER_DEG * Math.cos((drnLat * Math.PI) / 180));
+    const hapsAlt = +(18 + rand() * 2).toFixed(1);
+
+    const norm = (lon: number) => +(((lon + 540) % 360) - 180).toFixed(2);
+    out.push(
+      { id: `haps-gen-${n}`, name: `HAPS-${n}`, kind: 'haps', lat: +hapsLat.toFixed(2), lon: norm(hapsLon), altKm: hapsAlt, role: `Stratospheric relay (${region})`, region, health: healthOf() },
+      { id: `drone-gen-${n}`, name: `Drone-${n}`, kind: 'drone', lat: +drnLat.toFixed(2), lon: norm(drnLon), altKm: drnAlt, role: `Low-altitude relay (${region})`, region, health: healthOf() },
+      { id: `ground-gen-${n}`, name: `GS-${n}`, kind: 'ground', lat: +gsLat.toFixed(2), lon: norm(gsLon), altKm: 0, role: `Gateway station (${region})`, region, health: healthOf() },
+    );
+  }
+  return out;
+}
+
+const GENERATED_ASSETS: Asset[] = [
+  // LEO constellation — 43 generated + 7 curated = 50 (global coverage)
+  ...generateFleet({
+    kind: 'satellite',
+    prefix: 'LEO',
+    count: 43,
+    startIndex: 8,
+    altMin: 500,
+    altMax: 720,
+    latMin: -55,
+    latMax: 60,
+    role: 'Constellation capacity relay',
+    seed: 1337,
+  }),
+  // HAPS / Drone / GS operate as co-located clusters (site N = HAPS-N + Drone-N + GS-N):
+  // HAPS flies 2–5 km above its drone (above the cloud deck), the drone stays
+  // below the clouds, and the ground station sits 10–15 km away from the drone.
+  ...generateSites(18, 3, 4242),
+];
+
 export const ASSETS: Asset[] = [
   // LEO constellation (orchestrated, not owned) — spread across realistic orbits
-  { id: 'sat-th-1', name: 'OL-SAT-01', kind: 'satellite', lat: 16, lon: 102, altKm: 550, role: 'Optical downlink (Thailand)', region: 'Thailand', health: 'NOMINAL' },
-  { id: 'sat-th-2', name: 'OL-SAT-02', kind: 'satellite', lat: 4, lon: 111, altKm: 585, role: 'Capacity relay (APAC)', region: 'Thailand', health: 'NOMINAL' },
-  { id: 'sat-us-1', name: 'OL-SAT-04', kind: 'satellite', lat: 38, lon: -106, altKm: 545, role: 'Optical downlink (United States)', region: 'United States', health: 'NOMINAL' },
-  { id: 'sat-us-2', name: 'OL-SAT-05', kind: 'satellite', lat: 27, lon: -95, altKm: 605, role: 'Capacity relay (AMER)', region: 'United States', health: 'DEGRADED' },
-  { id: 'sat-pac', name: 'OL-SAT-07', kind: 'satellite', lat: 22, lon: -158, altKm: 640, role: 'Trans-Pacific crosslink', region: 'Pacific', health: 'NOMINAL' },
-  { id: 'sat-atl', name: 'OL-SAT-09', kind: 'satellite', lat: -18, lon: -32, altKm: 700, role: 'Orbital standby', region: 'Atlantic', health: 'NOMINAL' },
-  { id: 'sat-ind', name: 'OL-SAT-11', kind: 'satellite', lat: 48, lon: 62, altKm: 675, role: 'Orbital standby', region: 'Eurasia', health: 'NOMINAL' },
+  { id: 'sat-th-1', name: 'LEO-1', kind: 'satellite', lat: 16, lon: 102, altKm: 550, role: 'Optical downlink (Thailand)', region: 'Thailand', health: 'NOMINAL' },
+  { id: 'sat-th-2', name: 'LEO-2', kind: 'satellite', lat: 4, lon: 111, altKm: 585, role: 'Capacity relay (APAC)', region: 'Thailand', health: 'NOMINAL' },
+  { id: 'sat-us-1', name: 'LEO-3', kind: 'satellite', lat: 38, lon: -106, altKm: 545, role: 'Optical downlink (United States)', region: 'United States', health: 'NOMINAL' },
+  { id: 'sat-us-2', name: 'LEO-4', kind: 'satellite', lat: 27, lon: -95, altKm: 605, role: 'Capacity relay (AMER)', region: 'United States', health: 'DEGRADED' },
+  { id: 'sat-pac', name: 'LEO-5', kind: 'satellite', lat: 22, lon: -158, altKm: 640, role: 'Trans-Pacific crosslink', region: 'Pacific', health: 'NOMINAL' },
+  { id: 'sat-atl', name: 'LEO-6', kind: 'satellite', lat: -18, lon: -32, altKm: 700, role: 'Orbital standby', region: 'Atlantic', health: 'NOMINAL' },
+  { id: 'sat-ind', name: 'LEO-7', kind: 'satellite', lat: 48, lon: 62, altKm: 675, role: 'Orbital standby', region: 'Eurasia', health: 'NOMINAL' },
 
   // HAPS — stratospheric, 18-20 km
-  { id: 'haps-th', name: 'HAPS-TH-01', kind: 'haps', lat: 14.1, lon: 100.9, altKm: 19, role: 'Stratospheric relay over Thailand', region: 'Thailand', health: 'NOMINAL' },
-  { id: 'haps-us', name: 'HAPS-US-01', kind: 'haps', lat: 39.2, lon: -104.4, altKm: 19.5, role: 'Stratospheric relay over United States', region: 'United States', health: 'NOMINAL' },
+  { id: 'haps-th', name: 'HAPS-1', kind: 'haps', lat: 13.68, lon: 100.45, altKm: 19, role: 'Stratospheric relay over Thailand', region: 'Thailand', health: 'NOMINAL' },
+  { id: 'haps-us', name: 'HAPS-2', kind: 'haps', lat: 39.85, lon: -105.07, altKm: 19.5, role: 'Stratospheric relay over United States', region: 'United States', health: 'NOMINAL' },
 
   // Relay drones
-  { id: 'drn-th', name: 'Drone Alpha', kind: 'drone', lat: 13.4, lon: 100.2, altKm: 4, role: 'Low-altitude relay over Thailand', region: 'Thailand', health: 'NOMINAL' },
-  { id: 'drn-us', name: 'Drone Bravo', kind: 'drone', lat: 40.1, lon: -105.4, altKm: 4, role: 'Low-altitude relay over United States', region: 'United States', health: 'NOMINAL' },
+  { id: 'drn-th', name: 'Drone-1', kind: 'drone', lat: 13.66, lon: 100.44, altKm: 4, role: 'Low-altitude relay over Thailand', region: 'Thailand', health: 'NOMINAL' },
+  { id: 'drn-us', name: 'Drone-2', kind: 'drone', lat: 39.83, lon: -105.08, altKm: 4, role: 'Low-altitude relay over United States', region: 'United States', health: 'NOMINAL' },
 
   // Ground stations
-  { id: 'gs-th', name: 'GS Bangkok', kind: 'ground', lat: 13.75, lon: 100.52, altKm: 0, role: 'Primary gateway', region: 'Thailand', health: 'NOMINAL' },
-  { id: 'gs-us', name: 'GS Denver', kind: 'ground', lat: 39.74, lon: -104.99, altKm: 0, role: 'Primary gateway', region: 'United States', health: 'NOMINAL' },
+  { id: 'gs-th', name: 'GS-1', kind: 'ground', lat: 13.75, lon: 100.52, altKm: 0, role: 'Primary gateway', region: 'Thailand', health: 'NOMINAL' },
+  { id: 'gs-us', name: 'GS-2', kind: 'ground', lat: 39.74, lon: -104.99, altKm: 0, role: 'Primary gateway', region: 'United States', health: 'NOMINAL' },
 
   // Customer networks
   { id: 'cus-th', name: 'TH Enterprise Edge', kind: 'customer', lat: 13.9, lon: 100.85, altKm: 0, role: 'Fiber handoff', region: 'Thailand', health: 'NOMINAL' },
   { id: 'cus-us', name: 'US Metro Core', kind: 'customer', lat: 39.55, lon: -104.6, altKm: 0, role: 'Fiber handoff', region: 'United States', health: 'NOMINAL' },
+
+  // Generated fleet — brings totals to 50 LEO, 20 HAPS, 20 drones, 20 ground stations
+  ...GENERATED_ASSETS,
 ];
 
 
@@ -172,6 +307,7 @@ export const SEGMENTS: Segment[] = [
   seg('s-satth2-hapsth', 'sat-th-2', 'haps-th', 'FSO'),
   seg('s-hapsth-drnth', 'haps-th', 'drn-th', 'MICROWAVE'),
   seg('s-drnth-gsth', 'drn-th', 'gs-th', 'RF'),
+  seg('s-drnth-gsth-fso', 'drn-th', 'gs-th', 'FSO'),
   seg('s-hapsth-gsth', 'haps-th', 'gs-th', 'RF'),
   seg('s-gsth-custh', 'gs-th', 'cus-th', 'FIBER'),
 
@@ -181,9 +317,14 @@ export const SEGMENTS: Segment[] = [
   seg('s-satus2-hapsus', 'sat-us-2', 'haps-us', 'FSO'),
   seg('s-hapsus-drnus', 'haps-us', 'drn-us', 'MICROWAVE'),
   seg('s-drnus-gsus', 'drn-us', 'gs-us', 'RF'),
+  seg('s-drnus-gsus-fso', 'drn-us', 'gs-us', 'FSO'),
   seg('s-hapsus-gsus', 'haps-us', 'gs-us', 'RF'),
   seg('s-gsus-cusus', 'gs-us', 'cus-us', 'FIBER'),
 ];
+
+const SEGMENT_BY_ID: Record<string, Segment> = Object.fromEntries(
+  SEGMENTS.map((s) => [s.id, s])
+);
 
 
 export interface ScenarioProfile {
@@ -203,6 +344,8 @@ export interface ScenarioProfile {
   };
   /** ordered asset ids of the AI-selected primary route */
   route: string[];
+  /** ordered segment ids of the primary route — pins the exact transport per hop */
+  routeSegmentIds: string[];
   blockedTech: Tech[];
   weather: WeatherCell[];
   ai: {
@@ -214,10 +357,21 @@ export interface ScenarioProfile {
   alerts: { id: string; level: 'INFO' | 'WARN' | 'CRITICAL'; text: string }[];
 }
 
+/**
+ * Purely visual baseline cloud field, shown when the active scenario carries no
+ * weather cells. Not part of routing/exposure maths — display only.
+ */
+export const AMBIENT_CELLS: WeatherCell[] = [
+  { id: 'wa1', name: 'Thin cirrus APAC', lat: 11, lon: 104, size: 0.1, severity: 12, kind: 'CLOUD' },
+  { id: 'wa2', name: 'Thin cirrus NA', lat: 38, lon: -101, size: 0.09, severity: 10, kind: 'CLOUD' },
+  { id: 'wa3', name: 'Marine layer ATL', lat: 24, lon: -42, size: 0.12, severity: 14, kind: 'CLOUD' },
+];
+
 const CLOUD_CELLS: WeatherCell[] = [
   { id: 'w1', name: 'Cloud deck TH-4', lat: 13, lon: 101, size: 0.16, severity: 46, kind: 'CLOUD' },
   { id: 'w2', name: 'Cloud deck US-2', lat: 40, lon: -104, size: 0.14, severity: 38, kind: 'CLOUD' },
 ];
+
 
 const RAIN_CELLS: WeatherCell[] = [
   { id: 'w1', name: 'Monsoon band TH', lat: 13.5, lon: 100.8, size: 0.2, severity: 74, kind: 'RAIN' },
@@ -242,6 +396,7 @@ export const SCENARIOS: Record<ScenarioId, ScenarioProfile> = {
     systemMode: 'DIRECT OPTICAL',
     telemetry: { bandwidth: 10.0, latency: 14, packetLoss: 0.02, signal: 98, availability: 99.98 },
     route: ['sat-th-1', 'gs-th', 'cus-th'],
+    routeSegmentIds: ['s-satth1-gsth', 's-gsth-custh'],
     blockedTech: [],
     weather: [],
     ai: {
@@ -262,11 +417,12 @@ export const SCENARIOS: Record<ScenarioId, ScenarioProfile> = {
     systemMode: 'ADAPTIVE RELAY',
     telemetry: { bandwidth: 6.4, latency: 38, packetLoss: 0.9, signal: 71, availability: 97.2 },
     route: ['sat-th-1', 'haps-th', 'drn-th', 'gs-th', 'cus-th'],
+    routeSegmentIds: ['s-satth1-hapsth', 's-hapsth-drnth', 's-drnth-gsth-fso', 's-gsth-custh'],
     blockedTech: ['OPTICAL'],
     weather: CLOUD_CELLS,
     ai: {
       analysis: ['Cloud layer detected at 12 km', 'Direct laser link unavailable', 'FSO viable above cloud deck'],
-      recommendation: ['Reroute via HAPS-TH-01', 'Drone Alpha microwave hop', 'Terminate at GS Bangkok'],
+      recommendation: ['Reroute via HAPS-1', 'Drone-1 microwave hop', 'Terminate at GS-1'],
       confidence: 94,
       action: 'REROUTE VIA HAPS',
     },
@@ -282,11 +438,12 @@ export const SCENARIOS: Record<ScenarioId, ScenarioProfile> = {
     systemMode: 'RF BACKBONE',
     telemetry: { bandwidth: 3.1, latency: 62, packetLoss: 2.4, signal: 54, availability: 92.4 },
     route: ['sat-us-1', 'haps-us', 'drn-us', 'gs-us', 'cus-us'],
+    routeSegmentIds: ['s-satus1-hapsus', 's-hapsus-drnus', 's-drnus-gsus', 's-gsus-cusus'],
     blockedTech: ['OPTICAL', 'FSO'],
     weather: RAIN_CELLS,
     ai: {
       analysis: ['Rain attenuation 11.2 dB/km', 'Optical and FSO unavailable', 'Microwave margin acceptable'],
-      recommendation: ['Shift traffic to HAPS-US-01', 'Drone Bravo microwave hop', 'Terminate at GS Denver'],
+      recommendation: ['Shift traffic to HAPS-2', 'Drone-2 microwave hop', 'Terminate at GS-2'],
       confidence: 96,
       action: 'ENGAGE MICROWAVE',
     },
@@ -305,11 +462,12 @@ export const SCENARIOS: Record<ScenarioId, ScenarioProfile> = {
     systemMode: 'ADAPTIVE ROUTING',
     telemetry: { bandwidth: 1.62, latency: 85, packetLoss: 4.8, signal: 38, availability: 86.1 },
     route: ['sat-th-2', 'haps-th', 'drn-th', 'gs-th', 'cus-th'],
+    routeSegmentIds: ['s-satth2-hapsth', 's-hapsth-drnth', 's-drnth-gsth', 's-gsth-custh'],
     blockedTech: ['OPTICAL', 'FSO'],
     weather: STORM_CELLS,
     ai: {
       analysis: ['Severe storm detected over Thailand', 'All optical links unavailable', 'Route recalculating every 30 s'],
-      recommendation: ['HAPS-TH-01', 'Relay Drone Alpha', 'Microwave link', 'Ground Station Bangkok'],
+      recommendation: ['HAPS-1', 'Relay Drone-1', 'Microwave link', 'GS-1'],
       confidence: 96,
       action: 'AUTO REROUTE',
     },
@@ -363,13 +521,10 @@ export function linkStates(
   profile: ScenarioProfile,
   rerouting?: ReadonlySet<string>
 ): LinkState[] {
-  const routeSet = new Set<string>();
-  for (let i = 0; i < profile.route.length - 1; i++) {
-    routeSet.add(`${profile.route[i]}>${profile.route[i + 1]}`);
-  }
+  const routeSet = new Set<string>(profile.routeSegmentIds);
 
   return SEGMENTS.map((segment) => {
-    const onRoute = routeSet.has(`${segment.from}>${segment.to}`);
+    const onRoute = routeSet.has(segment.id);
     const { exposure, cells } = segmentExposure(segment, profile.weather);
     const sensitivity = TECH_SENSITIVITY[segment.tech];
     const impact = Math.round(exposure * sensitivity);
@@ -495,8 +650,15 @@ export function assetContext(
 }
 
 
-/** Ordered segments (in route direction) for a given asset-id chain. */
-export function routeSegments(route: string[]): Segment[] {
+/** Ordered segments (in route direction) for a given asset-id chain.
+ *  When `segmentIds` is supplied (ScenarioProfile.routeSegmentIds) it pins the
+ *  exact transport per hop; otherwise falls back to the first matching pair. */
+export function routeSegments(route: string[], segmentIds?: string[]): Segment[] {
+  if (segmentIds) {
+    return segmentIds
+      .map((id) => SEGMENT_BY_ID[id])
+      .filter((s): s is Segment => Boolean(s));
+  }
   const out: Segment[] = [];
   for (let i = 0; i < route.length - 1; i++) {
     const from = route[i]!;
