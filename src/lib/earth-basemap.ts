@@ -6,8 +6,8 @@
  */
 
 import { EARTH_8K_URL } from '@/lib/earth-textures';
-import earthNightAsset from '@/assets/earth_lights_2048.png.asset.json';
-const earthNight = earthNightAsset.url;
+import earthNight from '@/assets/earth_lights_2048.png';
+const earthNight = earthNight;
 
 
 /** Subsolar point — must match SUN_DIR in globe-scene (geoToVec(14, 178)). */
